@@ -15,14 +15,19 @@ import logging.config
 import subprocess
 import time
 import PyPDF2
-import html
 import shutil
 
-from hocrpdf import HocrPdf
+from Derivatives import Derivatives
 from MODSSpreader import MODSSpreader
 
 """logger placeholder"""
 logger = None
+
+"""derivative generator"""
+derivative_gen = None
+
+"""MODS spreader"""
+spreader = None
 
 """External programs needed for this to operate"""
 required_programs = [
@@ -32,8 +37,12 @@ required_programs = [
 ]
 
 """External programs needed for creating derivatives."""
-derivative_programs = [
+hocr_programs = [
     {'exec': 'tesseract', 'check_var': '-v'},
+]
+
+"""External programs for Jpeg2000 derivatives."""
+jp2_programs = [
     {'exec': 'kdu_compress', 'check_var': '-version'}
 ]
 
@@ -41,7 +50,7 @@ derivative_programs = [
 options = None
 
 """Regex - Count pages from parsed PDF."""
-rxcountpages = re.compile(b"/Type\s*/Page([^s]|$)", re.MULTILINE | re.DOTALL)
+rxcountpages = re.compile(rb"/Type\s*/Page([^s]|$)", re.MULTILINE | re.DOTALL)
 """Regex - Match HTML tags"""
 htmlmatch = re.compile(r'<[^>]+>', re.MULTILINE | re.DOTALL)
 """Regex - Match blank lines/characters"""
@@ -54,25 +63,25 @@ is_pdf = re.compile(r'.*\.pdf$', re.IGNORECASE)
 
 def preprocess_file(input_file):
     # Check for an existing directory
-    book_name = os.path.splitext(os.path.split(input_file)[1])[0]
+    original_book_name = os.path.splitext(os.path.split(input_file)[1])[0]
     book_number = None
-    if options.merge and re.search(r'\d+$', book_name) is not None:
-        (book_name, book_number, junk) = re.split(r'(\d+)$', book_name)
-        book_name = book_name.strip()
-    book_name = re.sub(r'[\s\',\-]+', '_', book_name.rstrip())
+    if options.merge and re.search(r'\d+$', original_book_name) is not None:
+        (original_book_name, book_number, junk) = re.split(r'(\d+)$', original_book_name)
+        original_book_name = original_book_name.strip()
+    sanitized_book_name = re.sub(r'[\s\',\-]+', '_', original_book_name.rstrip())
     book_dir = None
     if options.output_dir != '.':
         if options.output_dir[0:1] == '/' and os.path.exists(options.output_dir):
-            book_dir = os.path.join(options.output_dir, book_name + '_dir')
+            book_dir = os.path.join(options.output_dir, sanitized_book_name + '_dir')
         elif options.output_dir[0:1] != '/' and os.path.exists(os.path.join(os.getcwd(), options.output_dir)):
-            book_dir = os.path.join(os.getcwd(), options.output_dir, book_name + '_dir')
+            book_dir = os.path.join(os.getcwd(), options.output_dir, sanitized_book_name + '_dir')
     try:
         if book_dir is not None:
             logger.debug("Output directory was set to {}".format(book_dir))
     except UnboundLocalError:
         # not set, so use old default
-        book_dir = os.path.join(os.path.dirname(input_file), book_name + '_dir')
-    return book_dir, book_name, book_number
+        book_dir = os.path.join(os.path.dirname(input_file), sanitized_book_name + '_dir')
+    return book_dir, sanitized_book_name, book_number, original_book_name
 
 
 def process_file(input_file):
@@ -82,21 +91,26 @@ def process_file(input_file):
     pdf -- The full path to the input file
     """
     logger.info("Processing {}".format(input_file))
-    (book_dir, book_name, book_number) = preprocess_file(input_file)
+    (book_dir, book_name, book_number, unparsed_book_name) = preprocess_file(input_file)
     mods_file = None
     if not os.path.exists(book_dir):
         os.mkdir(book_dir)
     if options.mods_dir is not None:
-        tmpfile = os.path.join(options.mods_dir, book_name + '.mods')
-        logger.debug("We have a MODS directory to use {}, look for file {}".format(options.mods_dir, tmpfile))
-        if os.path.exists(tmpfile) and os.path.isfile(tmpfile):
-            logger.debug("Found file {} and it is a file.".format(tmpfile))
-            mods_file = os.path.join(book_dir, 'MODS.xml')
-            logger.debug("copy file to {} and set that as mods_file".format(mods_file))
-            shutil.copyfile(tmpfile, mods_file)
-            logger.debug("Setting up MODS spreader")
-            spread = MODSSpreader(logger=logger)
-        else:
+        tmpfiles = [
+            os.path.join(options.mods_dir, book_name + "." + options.mods_extension),
+            os.path.join(options.mods_dir, unparsed_book_name + "." + options.mods_extension)
+        ]
+        logger.debug("We have a MODS directory to use {}".format(options.mods_dir))
+        for tmpfile in tmpfiles:
+            logger.debug("Look for file {}".format(tmpfile))
+            if os.path.exists(tmpfile) and os.path.isfile(tmpfile):
+                logger.debug("Found file {} and it is a file.".format(tmpfile))
+                mods_file = os.path.join(book_dir, 'MODS.xml')
+                logger.debug("copy file to {} and set that as mods_file".format(mods_file))
+                shutil.copyfile(tmpfile, mods_file)
+                logger.debug("Setting up MODS spreader")
+                break
+        if mods_file is None:
             logger.error("Missing MODS file for {}".format(input_file))
 
     pages = count_pages(input_file)
@@ -121,35 +135,17 @@ def process_file(input_file):
         else:
             tiff_file = get_tiff_page(input_file, p, out_dir)
         if not options.skip_derivatives:
-            if not options.skip_hocr_ocr:
-                # Skip HOCR/OCR generation.
-                hocr_file = get_hocr(tiff_file, out_dir)
-                get_ocr(tiff_file, hocr_file, out_dir)
-            get_jpegs(tiff_file, out_dir)
-            if not is_pdf.match(input_file) and os.path.exists(os.path.join(out_dir, 'JP2.jp2')) and os.path.exists(
-                    os.path.join(out_dir, 'HOCR.html')):
-                # If we didn't start with a PDF, and we have a JP2 and HOCR file, we can create a PDF.
-                make_pdf(os.path.join(out_dir, 'JP2.jp2'), hocr_file, out_dir)
+            derivative_gen.do_page_derivatives(tiff_file, out_dir, input_file=input_file)
+
         if mods_file is not None:
             logger.debug("We have a mods_file.")
             # Copy mods file and insert
-            spread.make_page_mods(filename=mods_file, output_dir=os.path.join(book_dir, out_dir), page=p)
+            spreader.make_page_mods(filename=mods_file, output_dir=os.path.join(book_dir, out_dir), page=p)
     if not options.skip_derivatives:
-        if is_pdf.match(input_file):
-            # For our directory scanner, leave this as a manual process for now.
-            # Last copy the original PDF to the book level as PDF.pdf
-            shutil.copy(input_file, os.path.join(book_dir, 'PDF.pdf'))
-        elif has_page_pdfs(book_dir):
-            # Try to make a combined PDF.
-            operations = [
-                "gs", "-dBATCH", "-dNOPAUSE", "-q", "-sDEVICE=pdfwrite", "-dAutoRotatePages=/None",
-                "-sOutputFile={}".format(os.path.join(book_dir, 'PDF.pdf')), "$(", "find", "." , "-type", "f", "-name",
-                "'PDF.pdf'", "-print", "|", "sort", "-t'/'", "-k", "2,2", "-n", ")"
-            ]
-            do_system_call(operations)
-        if os.path.exists(os.path.join(book_dir, '1', 'TN.jpg')):
-            # Copy the first page thumbnail up to the book.
-            shutil.copy(os.path.join(book_dir, '1', 'TN.jpg'), os.path.join(book_dir, 'TN.jpg'))
+        derivative_gen.do_book_derivatives(input_file, book_dir)
+    if is_pdf.match(input_file):
+        # Copy the original PDF to the top-level book directory.
+        shutil.copyfile(input_file, os.path.join(book_dir, 'PDF.pdf'))
 
 
 def get_tiff(new_pdf, out_dir):
@@ -174,7 +170,7 @@ def get_tiff(new_pdf, out_dir):
         logger.debug("Generating Tiff")
         op = ['convert', '-density', str(altered_resolution), new_pdf, '-resize', '75%', '-colorspace', 'rgb', '-alpha',
               'Off', output_file]
-        if not do_system_call(op):
+        if not Derivatives.do_system_call(op, logger=logger):
             quit()
     return output_file
 
@@ -195,171 +191,9 @@ def get_tiff_page(tiff_file, page_num, out_dir):
     if not os.path.exists(output_file):
         logger.debug("Getting Tiff from multi-page Tiff")
         op = ['convert', '{0}[{1}]'.format(tiff_file, str(adjusted_page)), output_file]
-        if not do_system_call(op):
+        if not Derivatives.do_system_call(op, logger=logger):
             quit()
     return output_file
-
-
-def get_jpegs(tiff_file, out_dir):
-    """Produce the needed JPEGs for ingest.
-
-    Keyword arguments
-    tiff_file -- The tiff file
-    out_dir -- The directory to save the images to.
-    """
-    make_jpeg_2000(tiff_file, out_dir)
-    make_jpeg(tiff_file, out_dir, 'JPG', height=800, width=800)
-    make_jpeg(tiff_file, out_dir, 'TN', height=110, width=110)
-
-
-def make_jpeg_2000(tiff_file, out_dir, second_try=False):
-    size = get_image_size(tiff_file)
-    res = get_image_resolution(tiff_file)
-    loseless = (size['height'] < 1024 or size['width'] < 1024 or res['x'] < 300 or res['y'] < 300)
-    #loseless = True
-    just_file = os.path.split(tiff_file)[1]
-    output_file = os.path.join(out_dir, 'JP2.jp2')
-
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-
-    if not os.path.exists(output_file):
-        logger.debug("Generating Jpeg2000")
-        # Use Kakadu
-        op = ['kdu_compress', '-i', tiff_file, '-o', output_file]
-        if loseless:
-            # Do loseless
-            op.extend(['-quiet', 'Creversible=yes', '-rate', '-,1,0.5,0.25', 'Clevels=5'])
-        else:
-            op.extend(['-quiet', 'Clayers=5', 'Clevels=7',
-                       'Cprecincts={256,256},{256,256},{256,256},{128,128},{128,128},{64,64},{64,64},{32,32},{16,16}',
-                       'Corder=RPCL', 'ORGgen_plt=yes', 'ORGtparts=R', 'Cblk={32,32}', 'Cuse_sop=yes'])
-        if not do_system_call(op):
-            if is_compressed(tiff_file) and not second_try:
-                # We failed, the tiff is compressed and we haven't tried with an uncompressed tiff
-                temp_tiff = os.path.join(os.path.dirname(tiff_file),
-                                         os.path.splitext(just_file)[0] + "_tmp" + os.path.splitext(just_file)[1])
-                op = ['convert', '-compress', 'None', tiff_file, temp_tiff]
-                do_system_call(op, timeout=600)
-                make_jpeg_2000(temp_tiff, out_dir, second_try=True)
-            else:
-                # We failed
-                logger.error("Failed to generate JPEG2000 from %s" % tiff_file)
-                print("Failed to generate JPEG2000 from %s" % tiff_file)
-                os.remove(tiff_file)
-                quit(1)
-
-        if second_try:
-            # If we made an uncompressed copy, delete it.
-            os.remove(tiff_file)
-
-
-def make_jpeg(tiff_file, out_dir, out_name, height=None, width=None):
-    """Make a Jpeg of max size height x width"""
-
-    op = ['convert', tiff_file]
-
-    output_file = os.path.join(out_dir, out_name + '.jpg')
-
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-
-    if not os.path.exists(output_file):
-        logger.debug("Creating JPEG with size maximum width and height {}x{}".format(width, height))
-        if height is not None or width is not None:
-            op.append('-resize')
-            if height is not None and width is not None:
-                op.append("{}x{}".format(width, height))
-            elif width is not None:
-                op.append(width)
-            else:
-                op.append("x{}".format(height))
-        op.append(output_file)
-
-        do_system_call(op)
-
-
-def image_magick_opts(lossless=False):
-    """Stores and returns the Kakadu JP2 creation args"""
-    args = list()
-    args.append(" -depth 8")
-    args.append(" -define jp2:tilewidth=1024")
-    args.append(" -define jp2:tileheight=1024")
-    if lossless:
-        args.append(" -define numrlvls=6")
-        args.append(" -define jp2:rate=1.0")
-        args.append(" -define jp2:lazy")
-        args.append(" -define jp2:prg=rlcp")
-        args.append(
-            " -define jp2:ilyrrates='0.015625,0.01858,0.0221,0.025,0.03125,0.03716,0.04419,0.05,0.0625,0.075,0.088,0.1,0.125,0.15,0.18,0.21,0.25,0.3,0.35,0.4,0.5,0.6,0.7,0.84'")
-        args.append(" -define jp2:mode=int")
-    else:
-        args.append("-define numrlvls=7")
-        args.append("-define jp2:rate=0.02348")
-        args.append("-define jp2:prg=rpcl")
-        args.append("-define jp2:mode=int")
-        args.append("-define jp2:prcwidth=16383")
-        args.append("-define jp2:prcheight=16383")
-        args.append("-define jp2:cblkwidth=64")
-        args.append("-define jp2:cblkheight=64")
-        args.append("-define jp2:sop")
-    return args
-
-
-def is_compressed(image_file):
-    """Does identify see compression on the file."""
-    logger.debug("Checking compression for {}".format(image_file))
-    op = ['identify', '-format', '%[C]', image_file]
-    result = do_system_call(ops=op, return_result=True)
-    return result.rstrip('\r\n') != "None"
-
-
-def get_bit_depth(image_file):
-    """Return the bit depth"""
-    op = ['identify', '-format', '%[depth]', image_file]
-    result = do_system_call(ops=op, return_result=True)
-    result = result.rstrip('\r\n')
-    logger.debug("Getting the bit depth ({}) for {}".format(result, image_file))
-    return int(result)
-
-
-def get_image_size(image_file):
-    """Return a dict of the height and width of the image"""
-    logger.debug("Getting the height and width of {}".format(image_file))
-    op = ['identify', '-format', '%[height]-%[width]', image_file]
-    result = do_system_call(ops=op, return_result=True)
-    if not result:
-        logger.error("Problem getting image size for %s: %s" % (image_file, result))
-        print("Problem getting image size for %s: %s" % (image_file, result))
-        quit(1)
-    res_list = result.rstrip('\r\n').split('-')
-    return {'height': int(res_list[0]), 'width': int(res_list[1])}
-
-
-def get_image_resolution(image_file):
-    """Return a dict of the X and Y resolutions of the image"""
-    logger.debug("Getting the resolutions of {}".format(image_file))
-    op = ['identify', '-format', '%x-%y', image_file]
-    result = do_system_call(ops=op, return_result=True)
-    result = result.rstrip('\r\n')
-    if result.lower().find("undefined"):
-        result = result.lower().replace("undefined", "")
-    res_list = result.split('-')
-    res_list = [int(re.search(r'\d+', value).group(0)) for value in res_list]
-    logger.debug("Image resolution is " + str(res_list))
-    return {'x': res_list[0], 'y': res_list[1]}
-
-
-def has_page_pdfs(out_dir):
-    logger.debug("Checking for PDFs in the page directories of %s" % out_dir)
-    for path, dirs, files in os.walk(out_dir):
-        if dirs == out_dir:
-            continue
-        if 'PDF.pdf' in files:
-            return True
-    return False
 
 
 def get_pdf_page(pdf, page, out_dir):
@@ -385,140 +219,9 @@ def get_pdf_page(pdf, page, out_dir):
               '-dAutoRotatePages=/None',
               '-sOutputFile={}'.format(output_file),
               '-dFirstPage={}'.format(str(page)), '-dLastPage={}'.format(str(page)), pdf]
-        if not do_system_call(op):
+        if not Derivatives.do_system_call(op, logger=logger):
             quit()
     return output_file
-
-
-def get_ocr(tiff_file, hocr_file, out_dir):
-    """Which way to get OCR.
-
-    Keyword arguments
-    tiff_file -- Tiff file to process from
-    hocr_file -- Hocr file to extract from
-    out_dir -- Directory to write OCR file to.
-    """
-    if tiff_file is not None and os.path.exists(tiff_file) and os.path.isfile(tiff_file) and not options.use_hocr:
-        process_ocr(tiff_file, out_dir)
-    elif hocr_file is not None and os.path.exists(hocr_file) and os.path.isfile(hocr_file) and options.use_hocr:
-        get_ocr_from_hocr(hocr_file, out_dir)
-    else:
-        logger.error("Unable to generate OCR")
-
-
-def get_ocr_from_hocr(hocr_file, out_dir):
-    """Extract OCR from the Hocr data
-
-    Keyword arguments
-    hocr_file -- The HOCR file
-    out_dir -- Directory to write OCR file to.
-    """
-    output_file = os.path.join(out_dir, 'OCR.txt')
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-    if not os.path.exists(output_file):
-        logger.debug("Generating OCR.")
-        data = ''
-        with open(hocr_file, 'r') as fpr:
-            data += fpr.read()
-        data = html.unescape(blanklines.sub('', htmlmatch.sub('\1', data)))
-        with open(output_file, 'w') as fpw:
-            fpw.write(data)
-
-
-def process_ocr(tiff_file, out_dir):
-    """Get the OCR from a Tiff file.
-
-    Keyword arguments
-    tiff_file -- The TIFF image
-    out_dir -- The output directory"""
-    output_file = os.path.join(out_dir, 'OCR.txt')
-    output_stub = os.path.join(out_dir, 'OCR')
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-    if not os.path.exists(output_file):
-        logger.debug("Generating OCR.")
-        op = ['tesseract', tiff_file, output_stub, '-l', options.language]
-        if not do_system_call(op):
-            quit()
-
-
-def get_hocr(tiff_file, out_dir):
-    """Get the HOCR from a Tiff file.
-
-    Keyword arguments
-    tiff_file -- The TIFF image
-    out_dir -- The output directory"""
-    output_stub = os.path.join(out_dir, 'HOCR')
-    tmp_file = output_stub + '.hocr'
-    output_file = output_stub + '.html'
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-    if not os.path.exists(output_file):
-        logger.debug("Generating HOCR.")
-        op = ['tesseract', tiff_file, output_stub, '-l', options.language, 'hocr']
-        if not do_system_call(op, timeout=600):
-            quit()
-        os.rename(tmp_file, output_file)
-        if os.path.exists(output_stub + '.txt') and options.use_hocr:
-            # Some tesseracts seem to generate OCR at the same time as HOCR,
-            # so lets move it to OCR if we are going to create OCR from HOCR.
-            os.rename(output_stub + '.txt', os.path.join(out_dir, 'OCR.txt'))
-    return output_file
-
-
-def make_pdf(jp2_file, hocr_file, out_dir):
-    """Make PDF out of JP2 and HOCR."""
-    hocr = HocrPdf()
-    if options.debug_level == 'DEBUG':
-        hocr.enable_debug()
-    output_file = os.path.join(out_dir, 'PDF.pdf')
-    if os.path.exists(output_file) and os.path.isfile(output_file) and options.overwrite:
-        os.remove(output_file)
-        logger.debug("{} exists and we are deleting it.".format(output_file))
-    if not os.path.exists(output_file):
-        logger.debug("Generating searchable PDF from tiff and hocr.")
-        hocr.create_pdf(image_file=jp2_file, hocr_file=hocr_file, pdf_filename=output_file, dpi=options.resolution)
-
-
-def do_system_call(ops, return_result=False, timeout=60, fail_on_error=True):
-    """Execute an external system call
-
-    Keyword arguments
-    ops -- a list of the executable and any arguments.
-    return_result -- return the result of the call if successful.
-    timeout -- Time to wait for the process to complete.
-    """
-    logger.debug("Running system call - %s" % " ".join(ops))
-    try:
-        if sys.version_info.major == 3 and sys.version_info.minor < 7:
-            process = subprocess.run(ops, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-                                     universal_newlines=True)
-        else:
-            process = subprocess.run(ops, capture_output=True, timeout=timeout, universal_newlines=True)
-        outs = process.stdout
-        errs = process.stderr
-        if not process.returncode == 0 and fail_on_error:
-            logger.error("Error executing command: \n{}\nOutput: {}\nError: {}".format(' '.join(ops), outs, errs))
-            return False
-    except TimeoutError as e:
-        logger.error(
-            "Error executing command: \n{}\nMessage: {}\nOutput: {}\nSTDOUT: ".format(e.cmd, e.stderr, e.output,
-                                                                                          e.stdout))
-        return False
-    except subprocess.CalledProcessError as e:
-        logger.error(
-            "Error executing command: \n{}\nMessage: {}\nOutput: {}\nSTDOUT: ".format(e.cmd, e.stderr, e.output,
-                                                                                      e.stdout))
-        return False
-    logger.debug("Command result:\n{}".format(outs))
-    if return_result:
-        return outs
-    else:
-        return True
 
 
 def count_pages(input_file):
@@ -539,7 +242,7 @@ def count_pages(input_file):
         ops = [
             'identify', '-strip', '-ping', '-format', "%n\\n", input_file
         ]
-        results = do_system_call(ops, return_result=True, fail_on_error=False)
+        results = Derivatives.do_system_call(ops, logger=logger, return_result=True, fail_on_error=False)
         count = int(results.rstrip().split('\n').pop())
 
     return count
@@ -593,22 +296,24 @@ def set_up(args):
     Keyword arguments
     args -- the ArgumentParser object
     """
-    global options
+    global options, derivative_gen, spreader
     options = args
     setup_log()
-    if options.skip_derivatives:
-        test_programs = required_programs
-    else:
-        test_programs = required_programs
-        test_programs.extend(derivative_programs)
+    derivative_gen = Derivatives(options, logger)
+    spreader = MODSSpreader(logger=logger)
+    test_programs = required_programs
+    if not options.skip_derivatives and not options.skip_hocr_ocr:
+        test_programs.extend(hocr_programs)
+    if not options.skip_derivatives and not options.skip_jp2:
+        test_programs.extend(jp2_programs)
 
-        try:
-            for prog in test_programs:
-                subprocess.run([prog.get('exec'), prog.get('check_var')], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, check=True)
-        except FileNotFoundError as e:
-            print("A required program could not be found: {}".format(e.strerror.split(':')[1]))
-            quit()
+    try:
+        for prog in test_programs:
+            subprocess.run([prog.get('exec'), prog.get('check_var')], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True)
+    except FileNotFoundError as e:
+        print("A required program could not be found: {}".format(e.strerror.split(':')[1]))
+        quit()
 
 
 def setup_log():
@@ -650,8 +355,11 @@ def main():
                         help='Generate OCR by stripping HTML characters from HOCR, otherwise run tesseract a second '
                              'time. Defaults to use tesseract.')
     parser.add_argument('--mods-dir', dest="mods_dir", default=None,
-                        help='Directory of files with a matching name but with the extension ".mods" to be added to '
-                             'the books.')
+                        help='Directory of files with a matching name but with the extension "mods" to be added to '
+                             'the books. By default it checks the "files" argument if it is a directory.')
+    parser.add_argument('--mods-extension', dest="mods_extension", default="mods",
+                        help="The extension of the MODS files existing in the above directory. Files are matched based "
+                             "on filename but with this extension. Defaults to 'mods'")
     parser.add_argument('--output-dir', dest="output_dir", default=".",
                         help="Directory to build books in, defaults to current directory.")
     parser.add_argument('--merge', dest="merge", action='store_true', default=False,
@@ -662,6 +370,8 @@ def main():
                              'derivatives.')
     parser.add_argument('--skip-hocr-ocr', dest="skip_hocr_ocr", action='store_true', default=False,
                         help='Do not generate OCR/HOCR datastreams, this cannot be used with --skip-derivatives')
+    parser.add_argument('--skip-jp2', dest="skip_jp2", action='store_true', default=False,
+                        help='Do not generate JP2 datastreams, this cannot be used with --skip-derivatives')
     parser.add_argument('-l', '--loglevel', dest="debug_level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         default='ERROR', help='Set logging level, defaults to ERROR.')
     args = parser.parse_args()
@@ -670,6 +380,10 @@ def main():
         # Relative filepath
         args.files = os.path.join(os.getcwd(), args.files)
 
+    # If we provide an input directory and no MODS directory, use the input directory.
+    if args.mods_dir is None and os.path.isdir(args.files):
+        args.mods_dir = args.files
+
     if args.mods_dir is not None:
         if not args.mods_dir[0] == '/':
             # Relative directory
@@ -677,6 +391,7 @@ def main():
         if not (os.path.exists(args.mods_dir) or os.path.isdir(args.mods_dir)):
             parser.error("--mods-dir was not found or is not a directory.")
             quit()
+
     if args.merge and args.overwrite:
         parser.error("--merge and --overwrite are mutually exclusive options, you can only use one at a time.")
 
@@ -685,6 +400,14 @@ def main():
               "before the extension. Files are sorted by the number and require an empty starting directory. If the "
               "expected directory contains files, it will halt with a warning.")
         input("Press any key to proceed")
+
+    # If the output directory does not exist, try to create it.
+    if not os.path.exists(args.output_dir):
+        os.mkdir(args.output_dir)
+
+    if args.mods_extension is not None:
+        # Strip leading periods from the extension
+        args.mods_extension = args.mods_extension.lstrip(".")
 
     if os.path.isfile(args.files) and valid_extensions.match(args.files):
         set_up(args)
